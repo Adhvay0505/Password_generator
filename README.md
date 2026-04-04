@@ -4,14 +4,17 @@ A secure, encrypted password manager written in pure Bash.
 
 ## Features
 
-- AES-256-CBC encryption with PBKDF2 key derivation
-- Master password protection
-- Strong password generation
+- Full-screen keyboard-driven TUI with arrow-key navigation
+- AES-256-CBC encryption with PBKDF2-SHA256 key derivation
+- Private temp-file vault handling during unlocked sessions
+- Strong master-password policy for new vault creation
+- Strong password generation backed by `/dev/urandom`
 - Add custom passwords
 - Update existing entries
-- Search, view, and delete passwords
+- Search, browse, and delete passwords
 - List services
-- Copy to clipboard (if `pbcopy`, `xclip`, or `xsel` is available)
+- Copy to clipboard with timed auto-clear (if `pbcopy`, `xclip`, or `xsel` is available)
+- Automatic migration for older `BASHPASS_V1` vault headers and plaintext legacy stores
 
 ## Requirements
 
@@ -46,4 +49,4 @@ Your vault is stored in `password_store.csv.enc` - safe to copy/back up.
 
 ## Security
 
-Master password is never stored. Use at your own risk.
+Master password is never stored. During normal use, the decrypted vault is kept in a private temporary file and wiped on exit/signals. Clipboard copies are automatically cleared after a short timeout when supported by the local clipboard tool.

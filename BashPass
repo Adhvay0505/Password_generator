@@ -1,22 +1,51 @@
 #!/bin/bash
 
-PASSWORD_FILE="password_store.csv"
-ENCRYPTED_FILE="password_store.csv.enc"
-STORE_HEADER="BASHPASS_V1"
+set -o pipefail
+
+readonly LEGACY_PASSWORD_FILE="password_store.csv"
+readonly ENCRYPTED_FILE="password_store.csv.enc"
+readonly STORE_HEADER="BASHPASS_V2"
+readonly PREVIOUS_STORE_HEADER="BASHPASS_V1"
+readonly LEGACY_MARKER="BASHPASS_MARKER"
+readonly PBKDF2_ITERATIONS=250000
+readonly CLIPBOARD_TIMEOUT=20
+readonly MIN_MASTER_PASSWORD_LENGTH=14
+readonly MIN_GENERATED_PASSWORD_LENGTH=12
+
 MASTER_PASSWORD=""
+MASTER_PASSWORD_CONFIRM=""
+PASSWORD_FILE=""
+VAULT_TMPDIR=""
+VAULT_UNLOCKED=0
+LAST_STATUS="Vault locked."
+LAST_STATUS_KIND="info"
+MENU_SELECTION=0
+PROMPT_VALUE=""
+
+MENU_ITEMS=(
+    "Generate / Update Password"
+    "Add Custom Password"
+    "Browse Vault"
+    "Search Vault"
+    "Delete Entry"
+    "List Services"
+    "Copy Password"
+    "Lock And Exit"
+)
 
 umask 077
 
 setup_ui() {
     if [[ -t 1 ]]; then
         C_RESET=$'\033[0m'
-        C_TITLE=$'\033[1;32m'
-        C_ACCENT=$'\033[1;92m'
-        C_OK=$'\033[1;32m'
-        C_WARN=$'\033[1;31m'
+        C_TITLE=$'\033[1;97m'
+        C_ACCENT=$'\033[1;96m'
+        C_OK=$'\033[1;92m'
+        C_WARN=$'\033[1;91m'
         C_DIM=$'\033[0;90m'
-        C_PANEL=$'\033[0;32m'
-        C_PROMPT=$'\033[1;36m'
+        C_PANEL=$'\033[38;5;45m'
+        C_PROMPT=$'\033[1;93m'
+        C_SELECT=$'\033[48;5;24m\033[1;97m'
     else
         C_RESET=""
         C_TITLE=""
@@ -26,33 +55,100 @@ setup_ui() {
         C_DIM=""
         C_PANEL=""
         C_PROMPT=""
+        C_SELECT=""
     fi
 }
 
-ui_divider() {
+term_width() {
     local width
     width=$(tput cols 2>/dev/null)
-    if [[ -z "$width" ]] || [[ "$width" -lt 40 ]]; then
-        width=62
+    if [[ -z "$width" ]] || [[ "$width" -lt 72 ]]; then
+        width=72
     fi
-    printf "%*s\n" "$width" "" | tr ' ' '='
+    echo "$width"
 }
 
-ui_section() {
-    local title="$1"
-    ui_divider
-    printf "%b%s%b\n" "$C_TITLE" "$title" "$C_RESET"
-    ui_divider
+term_height() {
+    local height
+    height=$(tput lines 2>/dev/null)
+    if [[ -z "$height" ]] || [[ "$height" -lt 24 ]]; then
+        height=24
+    fi
+    echo "$height"
 }
 
-hacker_line() {
-    local label="$1"
-    local value="$2"
-    printf "%b[+] %-14s%b %s\n" "$C_PANEL" "$label" "$C_RESET" "$value"
+repeat_char() {
+    local count="$1"
+    local char="$2"
+    printf "%*s" "$count" "" | tr ' ' "$char"
+}
+
+print_centered() {
+    local text="$1"
+    local width
+    local padding
+    width=$(term_width)
+    padding=$(( (width - ${#text}) / 2 ))
+    if (( padding < 0 )); then
+        padding=0
+    fi
+    printf "%*s%s\n" "$padding" "" "$text"
+}
+
+draw_rule() {
+    local width
+    width=$(term_width)
+    printf "%b+%s+%b\n" "$C_PANEL" "$(repeat_char $((width - 2)) "-")" "$C_RESET"
+}
+
+draw_panel_line() {
+    local text="$1"
+    local width
+    width=$(term_width)
+    printf "%b| %-*.*s |%b\n" "$C_PANEL" $((width - 4)) $((width - 4)) "$text" "$C_RESET"
+}
+
+set_status() {
+    LAST_STATUS="$1"
+    LAST_STATUS_KIND="${2:-info}"
+}
+
+status_color() {
+    case "$LAST_STATUS_KIND" in
+        ok) printf "%s" "$C_OK" ;;
+        warn) printf "%s" "$C_WARN" ;;
+        *) printf "%s" "$C_ACCENT" ;;
+    esac
+}
+
+clear_screen() {
+    clear 2>/dev/null || printf '\033c'
+}
+
+print_logo() {
+    printf "%b" "$C_TITLE"
+    cat <<'EOF'
+ ____             _     ____                 
+| __ )  __ _ ___ | |__ |  _ \ __ _ ___ ___   
+|  _ \ / _` / __|| '_ \| |_) / _` / __/ __|  
+| |_) | (_| \__ \| | | |  __/ (_| \__ \__ \  
+|____/ \__,_|___/|_| |_|_|   \__,_|___/___/  
+EOF
+    printf "%b" "$C_RESET"
+}
+
+render_header() {
+    clear_screen
+    print_logo
+    printf "\n"
+    draw_rule
+    draw_panel_line "Top-tier Bash vault UI with private temp vaulting and safer password workflows"
+    draw_panel_line "Use Up/Down or j/k to navigate, Enter to select, q to exit"
+    draw_rule
 }
 
 vault_entry_count() {
-    if [[ ! -f "$PASSWORD_FILE" ]]; then
+    if [[ -z "$PASSWORD_FILE" || ! -f "$PASSWORD_FILE" ]]; then
         echo "0"
         return
     fi
@@ -63,413 +159,898 @@ vault_entry_count() {
     ' "$PASSWORD_FILE"
 }
 
-render_hacker_dashboard() {
-    local now entries host_name
-    now=$(date '+%Y-%m-%d %H:%M:%S')
+render_dashboard() {
+    local host_name now entries width
     host_name=$(hostname 2>/dev/null || echo "local")
+    now=$(date '+%Y-%m-%d %H:%M:%S UTC')
     entries=$(vault_entry_count)
-    ui_section "BASHPASS // VAULT CONSOLE"
-    hacker_line "operator" "${USER:-unknown}"
-    hacker_line "host" "$host_name"
-    hacker_line "timestamp" "$now"
-    hacker_line "vault_file" "$ENCRYPTED_FILE"
-    hacker_line "entries" "$entries"
-    echo
-    printf "%bCommands%b\n" "$C_TITLE" "$C_RESET"
-    printf "%b[1]%b gen/update    %b[2]%b add custom\n" "$C_ACCENT" "$C_RESET" "$C_ACCENT" "$C_RESET"
-    printf "%b[3]%b list all      %b[4]%b search\n" "$C_ACCENT" "$C_RESET" "$C_ACCENT" "$C_RESET"
-    printf "%b[5]%b delete        %b[6]%b services\n" "$C_ACCENT" "$C_RESET" "$C_ACCENT" "$C_RESET"
-    printf "%b[7]%b copy pass     %b[8]%b exit\n" "$C_ACCENT" "$C_RESET" "$C_ACCENT" "$C_RESET"
-    ui_divider
+    width=$(term_width)
+
+    draw_panel_line "Operator : ${USER:-unknown}"
+    draw_panel_line "Host     : $host_name"
+    draw_panel_line "Vault    : $ENCRYPTED_FILE"
+    draw_panel_line "Entries  : $entries"
+    draw_panel_line "Clock    : $now"
+    draw_rule
+    printf "%b%-*s%b\n" "$C_TITLE" "$width" " Main Menu" "$C_RESET"
+}
+
+render_status_bar() {
+    local width color
+    width=$(term_width)
+    color=$(status_color)
+    draw_rule
+    printf "%b| %-*.*s |%b\n" "$color" $((width - 4)) $((width - 4)) "Status: $LAST_STATUS" "$C_RESET"
+    draw_rule
 }
 
 pause_for_user() {
-    echo
-    read -r -p "Press Enter to return to console..." _
+    printf "\n%bPress Enter to continue...%b" "$C_DIM" "$C_RESET"
+    read -r _
 }
 
-validate_number() {
-    if ! [[ "$1" =~ ^[0-9]+$ ]] || [ "$1" -le 0 ]; then
-        echo "Invalid input: '$1'. Please enter a positive number."
-        exit 1
+pause_for_launch() {
+    printf "\n%bPress Enter to open the vault...%b" "$C_PROMPT" "$C_RESET"
+    read -r _
+}
+
+pause_for_retry() {
+    printf "\n%bPress Enter to try again...%b" "$C_PROMPT" "$C_RESET"
+    read -r _
+}
+
+show_notice() {
+    local title="$1"
+    local message="$2"
+    render_header
+    draw_panel_line "$title"
+    draw_panel_line "$message"
+    render_status_bar
+}
+
+read_key() {
+    local key
+    IFS= read -rsn1 key
+    if [[ "$key" == $'\x1b' ]]; then
+        IFS= read -rsn2 -t 0.1 key_rest
+        key+="$key_rest"
     fi
+    printf "%s" "$key"
 }
 
-validate_field() {
+menu_select() {
+    local selected="${2:-0}"
+    local title="$1"
+    local options=("${@:3}")
+    local key i width visible_start visible_end visible_count
+    local total="${#options[@]}"
+
+    while true; do
+        render_header
+        render_dashboard
+        printf "%b%s%b\n\n" "$C_ACCENT" "$title" "$C_RESET"
+
+        visible_count=$(( $(term_height) - 16 ))
+        if (( visible_count < 6 )); then
+            visible_count=6
+        fi
+        if (( total <= visible_count )); then
+            visible_start=0
+            visible_end=$total
+        else
+            visible_start=$((selected - visible_count / 2))
+            if (( visible_start < 0 )); then
+                visible_start=0
+            fi
+            visible_end=$((visible_start + visible_count))
+            if (( visible_end > total )); then
+                visible_end=$total
+                visible_start=$((visible_end - visible_count))
+            fi
+        fi
+
+        width=$(term_width)
+        for ((i = visible_start; i < visible_end; i++)); do
+            if (( i == selected )); then
+                printf "%b> %-*.*s%b\n" "$C_SELECT" $((width - 4)) $((width - 4)) "${options[$i]}" "$C_RESET"
+            else
+                printf "  %-*.*s\n" $((width - 4)) $((width - 4)) "${options[$i]}"
+            fi
+        done
+
+        printf "\n%b[Enter]%b open  %b[q]%b cancel\n" "$C_PROMPT" "$C_RESET" "$C_PROMPT" "$C_RESET"
+        render_status_bar
+        key=$(read_key)
+        case "$key" in
+            $'\x1b[A'|k|K)
+                ((selected--))
+                if (( selected < 0 )); then
+                    selected=$((total - 1))
+                fi
+                ;;
+            $'\x1b[B'|j|J)
+                ((selected++))
+                if (( selected >= total )); then
+                    selected=0
+                fi
+                ;;
+            "")
+                MENU_SELECTION="$selected"
+                return 0
+                ;;
+            q|Q)
+                return 1
+                ;;
+        esac
+    done
+}
+
+sanitize_field() {
     local value="$1"
     local label="$2"
     if [[ -z "$value" ]]; then
-        echo "Invalid $label: cannot be empty."
-        exit 1
+        set_status "Invalid $label: value cannot be empty." "warn"
+        return 1
     fi
-    if [[ "$value" == *","* ]] || [[ "$value" == *$'\n'* ]] || [[ "$value" == *$'\r'* ]]; then
-        echo "Invalid $label: commas and newlines are not allowed."
-        exit 1
+    if [[ "$value" == *","* || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+        set_status "Invalid $label: commas and newlines are not allowed." "warn"
+        return 1
     fi
+    return 0
+}
+
+validate_number() {
+    if ! [[ "$1" =~ ^[0-9]+$ ]] || (( $1 <= 0 )); then
+        set_status "Invalid number: '$1'." "warn"
+        return 1
+    fi
+    return 0
+}
+
+password_strength_label() {
+    local password="$1"
+    local score=0
+
+    (( ${#password} >= 12 )) && ((score+=1))
+    (( ${#password} >= 16 )) && ((score+=1))
+    [[ "$password" =~ [A-Z] ]] && ((score+=1))
+    [[ "$password" =~ [a-z] ]] && ((score+=1))
+    [[ "$password" =~ [0-9] ]] && ((score+=1))
+    [[ "$password" =~ [^A-Za-z0-9] ]] && ((score+=1))
+
+    if (( score >= 6 )); then
+        printf "excellent"
+    elif (( score >= 4 )); then
+        printf "strong"
+    elif (( score >= 3 )); then
+        printf "fair"
+    else
+        printf "weak"
+    fi
+}
+
+validate_master_password_strength() {
+    local password="$1"
+    local classes=0
+
+    if (( ${#password} < MIN_MASTER_PASSWORD_LENGTH )); then
+        set_status "Master password must be at least $MIN_MASTER_PASSWORD_LENGTH characters." "warn"
+        return 1
+    fi
+
+    [[ "$password" =~ [A-Z] ]] && ((classes+=1))
+    [[ "$password" =~ [a-z] ]] && ((classes+=1))
+    [[ "$password" =~ [0-9] ]] && ((classes+=1))
+    [[ "$password" =~ [^A-Za-z0-9] ]] && ((classes+=1))
+
+    if (( classes < 3 )); then
+        set_status "Master password must include at least 3 character classes." "warn"
+        return 1
+    fi
+
+    return 0
+}
+
+secure_random_number() {
+    od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' '
+}
+
+secure_pick_char() {
+    local charset="$1"
+    local rand idx
+    rand=$(secure_random_number)
+    idx=$(( rand % ${#charset} ))
+    printf "%s" "${charset:idx:1}"
+}
+
+shuffle_string() {
+    local input="$1"
+    local output="" remaining="$input" pick rand
+    while [[ -n "$remaining" ]]; do
+        rand=$(secure_random_number)
+        pick=$(( rand % ${#remaining} ))
+        output+="${remaining:pick:1}"
+        remaining="${remaining:0:pick}${remaining:pick+1}"
+    done
+    printf "%s" "$output"
 }
 
 generate_password() {
-    local PASS_LENGTH=$1
-    local UPPER='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-    local LOWER='abcdefghijklmnopqrstuvwxyz'
-    local DIGITS='0123456789'
-    local SPECIAL='!@#$%^&*()_+{}[]=-'
-    local ALL_CHARS="${UPPER}${LOWER}${DIGITS}${SPECIAL}"
-    
-    local password=""
-    password+="${UPPER:RANDOM%${#UPPER}:1}"
-    password+="${LOWER:RANDOM%${#LOWER}:1}"
-    password+="${DIGITS:RANDOM%${#DIGITS}:1}"
-    password+="${SPECIAL:RANDOM%${#SPECIAL}:1}"
-    
-    local remaining=$((PASS_LENGTH - 4))
-    for ((i=0; i<remaining; i++)); do
-        password+="${ALL_CHARS:RANDOM%${#ALL_CHARS}:1}"
+    local pass_length="$1"
+    local upper='ABCDEFGHJKLMNPQRSTUVWXYZ'
+    local lower='abcdefghijkmnopqrstuvwxyz'
+    local digits='23456789'
+    local special='!@#$%^&*()-_=+?'
+    local all="${upper}${lower}${digits}${special}"
+    local password="" i
+
+    if (( pass_length < MIN_GENERATED_PASSWORD_LENGTH )); then
+        pass_length=$MIN_GENERATED_PASSWORD_LENGTH
+    fi
+
+    password+=$(secure_pick_char "$upper")
+    password+=$(secure_pick_char "$lower")
+    password+=$(secure_pick_char "$digits")
+    password+=$(secure_pick_char "$special")
+
+    for ((i = 4; i < pass_length; i++)); do
+        password+=$(secure_pick_char "$all")
     done
-    
-    echo "$password"
+
+    shuffle_string "$password"
 }
 
-derive_key() {
-    echo -n "$MASTER_PASSWORD" | openssl dgst -sha256 -binary | xxd -p -c 32
+wipe_file() {
+    local target="$1"
+    if [[ -f "$target" ]]; then
+        if command -v shred >/dev/null 2>&1; then
+            shred -u "$target" 2>/dev/null || rm -f "$target"
+        else
+            rm -f "$target"
+        fi
+    fi
+}
+
+prepare_runtime_vault() {
+    if [[ -n "$PASSWORD_FILE" && -f "$PASSWORD_FILE" ]]; then
+        return 0
+    fi
+
+    if [[ -z "$VAULT_TMPDIR" || ! -d "$VAULT_TMPDIR" ]]; then
+        VAULT_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/bashpass.XXXXXX") || {
+            echo "Unable to allocate private temp directory."
+            exit 1
+        }
+        chmod 700 "$VAULT_TMPDIR" 2>/dev/null
+    fi
+
+    PASSWORD_FILE="$VAULT_TMPDIR/vault.csv"
 }
 
 ensure_password_file() {
-    if [[ ! -f "$PASSWORD_FILE" ]] || [[ ! -s "$PASSWORD_FILE" ]]; then
-        echo "$STORE_HEADER" > "$PASSWORD_FILE"
+    prepare_runtime_vault
+    if [[ ! -f "$PASSWORD_FILE" || ! -s "$PASSWORD_FILE" ]]; then
+        printf "%s\n" "$STORE_HEADER" > "$PASSWORD_FILE"
     fi
     chmod 600 "$PASSWORD_FILE" 2>/dev/null
 }
 
 encrypt_file() {
-    if [[ -f "$PASSWORD_FILE" ]]; then
-        ensure_password_file
-        openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -pass stdin -in "$PASSWORD_FILE" -out "$ENCRYPTED_FILE" 2>/dev/null <<<"$MASTER_PASSWORD"
-        local result=$?
-        rm -f "$PASSWORD_FILE"
-        if [[ $result -ne 0 ]] || [[ ! -f "$ENCRYPTED_FILE" ]]; then
-            echo "Error: Encryption failed. Check OpenSSL installation."
-            exit 1
-        fi
-        chmod 600 "$ENCRYPTED_FILE" 2>/dev/null
+    if [[ $VAULT_UNLOCKED -ne 1 ]]; then
+        return 0
     fi
+
+    ensure_password_file
+    local tmp_output
+    tmp_output="$VAULT_TMPDIR/vault.enc.tmp"
+
+    if ! openssl enc -aes-256-cbc -salt -pbkdf2 -iter "$PBKDF2_ITERATIONS" \
+        -md sha256 -pass stdin -in "$PASSWORD_FILE" -out "$tmp_output" 2>/dev/null <<<"$MASTER_PASSWORD"; then
+        set_status "Encryption failed. OpenSSL returned an error." "warn"
+        return 1
+    fi
+
+    chmod 600 "$tmp_output" 2>/dev/null
+    mv -f "$tmp_output" "$ENCRYPTED_FILE"
+    chmod 600 "$ENCRYPTED_FILE" 2>/dev/null
+    return 0
 }
 
 decrypt_file() {
-    if [[ -f "$ENCRYPTED_FILE" ]]; then
-        openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -pass stdin -in "$ENCRYPTED_FILE" -out "$PASSWORD_FILE" 2>/dev/null <<<"$MASTER_PASSWORD"
-        if [[ $? -ne 0 ]]; then
-            echo "Decryption failed! Wrong password or corrupted file."
-            rm -f "$PASSWORD_FILE" 2>/dev/null
-            exit 1
-        fi
+    prepare_runtime_vault
+    if [[ ! -f "$ENCRYPTED_FILE" ]]; then
+        ensure_password_file
+        return 0
+    fi
+
+    : > "$PASSWORD_FILE"
+    chmod 600 "$PASSWORD_FILE" 2>/dev/null
+    if ! openssl enc -aes-256-cbc -d -pbkdf2 -iter "$PBKDF2_ITERATIONS" \
+        -md sha256 -pass stdin -in "$ENCRYPTED_FILE" -out "$PASSWORD_FILE" 2>/dev/null <<<"$MASTER_PASSWORD"; then
+        wipe_file "$PASSWORD_FILE"
+        set_status "Decryption failed. Wrong password or corrupted vault." "warn"
+        return 1
+    fi
+
+    if head -n 1 "$PASSWORD_FILE" 2>/dev/null | grep -qx "$STORE_HEADER"; then
         chmod 600 "$PASSWORD_FILE" 2>/dev/null
+        return 0
+    fi
+
+    if head -n 1 "$PASSWORD_FILE" 2>/dev/null | grep -qx "$PREVIOUS_STORE_HEADER"; then
+        local migrated_v1
+        migrated_v1="$VAULT_TMPDIR/migrated-v1.csv"
+        awk -v header="$STORE_HEADER" 'NR == 1 { print header; next } { print }' \
+            "$PASSWORD_FILE" > "$migrated_v1"
+        mv -f "$migrated_v1" "$PASSWORD_FILE"
+        chmod 600 "$PASSWORD_FILE" 2>/dev/null
+        return 0
+    fi
+
+    if grep -q "^${LEGACY_MARKER}$" "$PASSWORD_FILE" 2>/dev/null; then
+        local migrated
+        migrated="$VAULT_TMPDIR/migrated.csv"
+        awk -v header="$STORE_HEADER" -v marker="$LEGACY_MARKER" '
+            BEGIN { print header }
+            $0 == marker { next }
+            NF { print }
+        ' "$PASSWORD_FILE" > "$migrated"
+        mv -f "$migrated" "$PASSWORD_FILE"
+        chmod 600 "$PASSWORD_FILE" 2>/dev/null
+        return 0
+    fi
+
+    wipe_file "$PASSWORD_FILE"
+    set_status "Vault header validation failed after decrypt." "warn"
+    return 1
+}
+
+cleanup() {
+    if [[ $VAULT_UNLOCKED -eq 1 ]]; then
+        encrypt_file >/dev/null 2>&1
+    fi
+    if [[ -n "$PASSWORD_FILE" ]]; then
+        wipe_file "$PASSWORD_FILE"
+    fi
+    if [[ -n "$VAULT_TMPDIR" && -d "$VAULT_TMPDIR" ]]; then
+        rmdir "$VAULT_TMPDIR" 2>/dev/null || rm -rf "$VAULT_TMPDIR" 2>/dev/null
     fi
 }
 
 prompt_master_password() {
     local attempts=0
     local max_attempts=3
-    
-    while [[ $attempts -lt $max_attempts ]]; do
-        read -sp "Enter Master Password: " MASTER_PASSWORD
-        echo
-        
-        if [[ -f "$ENCRYPTED_FILE" ]]; then
-            decrypt_file
-            if head -n 1 "$PASSWORD_FILE" 2>/dev/null | grep -qx "$STORE_HEADER"; then
-                return 0
-            elif grep -q "BASHPASS_MARKER" "$PASSWORD_FILE" 2>/dev/null; then
-                sed -i '/BASHPASS_MARKER/d' "$PASSWORD_FILE"
-                sed -i "1i $STORE_HEADER" "$PASSWORD_FILE"
-                return 0
-            else
-                rm -f "$PASSWORD_FILE" 2>/dev/null
-                echo "Wrong password! (Attempt $((attempts + 1))/$max_attempts)"
-                attempts=$((attempts + 1))
-            fi
-        else
+
+    while (( attempts < max_attempts )); do
+        render_header
+        draw_panel_line "Unlock vault"
+        draw_panel_line "PBKDF2 iterations: $PBKDF2_ITERATIONS"
+        draw_rule
+        printf "%bEnter master password:%b " "$C_PROMPT" "$C_RESET"
+        read -rsp "" MASTER_PASSWORD
+        printf "\n"
+
+        if decrypt_file; then
+            VAULT_UNLOCKED=1
+            set_status "Vault unlocked." "ok"
             return 0
         fi
+
+        ((attempts+=1))
+        set_status "Unlock failed ($attempts/$max_attempts)." "warn"
+        sleep 1
     done
-    
-    echo "Too many failed attempts. Exiting."
+
+    render_header
+    draw_panel_line "Too many failed unlock attempts."
+    render_status_bar
     exit 1
 }
 
-save_password() {
+setup_new_vault() {
+    local strength
+
+    while true; do
+        render_header
+        draw_panel_line "Create a new master password"
+        draw_panel_line "Minimum length: $MIN_MASTER_PASSWORD_LENGTH, at least 3 character classes"
+        draw_rule
+        printf "%bCreate master password:%b " "$C_PROMPT" "$C_RESET"
+        read -rsp "" MASTER_PASSWORD
+        printf "\n%bConfirm master password:%b " "$C_PROMPT" "$C_RESET"
+        read -rsp "" MASTER_PASSWORD_CONFIRM
+        printf "\n"
+
+        if [[ "$MASTER_PASSWORD" != "$MASTER_PASSWORD_CONFIRM" ]]; then
+            set_status "Passwords do not match." "warn"
+            show_notice "Master password was not accepted." "The two entries did not match."
+            pause_for_retry
+            continue
+        fi
+
+        if ! validate_master_password_strength "$MASTER_PASSWORD"; then
+            show_notice "Master password was not accepted." "$LAST_STATUS"
+            pause_for_retry
+            continue
+        fi
+
+        strength=$(password_strength_label "$MASTER_PASSWORD")
+        prepare_runtime_vault
+        printf "%s\n" "$STORE_HEADER" > "$PASSWORD_FILE"
+        chmod 600 "$PASSWORD_FILE" 2>/dev/null
+        VAULT_UNLOCKED=1
+        if ! encrypt_file; then
+            echo "Unable to initialize encrypted vault."
+            exit 1
+        fi
+        set_status "Vault created. Master password quality: $strength." "ok"
+        render_header
+        draw_panel_line "Vault created successfully."
+        draw_panel_line "Master password accepted and encrypted vault initialized."
+        draw_panel_line "Quality : $strength"
+        render_status_bar
+        pause_for_launch
+        return 0
+    done
+}
+
+maybe_migrate_plaintext_store() {
+    if [[ -f "$ENCRYPTED_FILE" ]]; then
+        return 0
+    fi
+
+    if [[ -f "$LEGACY_PASSWORD_FILE" && -s "$LEGACY_PASSWORD_FILE" ]]; then
+        render_header
+        draw_panel_line "Legacy plaintext vault detected: $LEGACY_PASSWORD_FILE"
+        draw_panel_line "It will be imported into the encrypted vault and then removed."
+        draw_rule
+
+        while true; do
+            printf "%bEnter a new master password for migration:%b " "$C_PROMPT" "$C_RESET"
+            read -rsp "" MASTER_PASSWORD
+            printf "\n%bConfirm master password:%b " "$C_PROMPT" "$C_RESET"
+            read -rsp "" MASTER_PASSWORD_CONFIRM
+            printf "\n"
+
+            if [[ "$MASTER_PASSWORD" != "$MASTER_PASSWORD_CONFIRM" ]]; then
+                set_status "Passwords do not match." "warn"
+                show_notice "Migration password was not accepted." "The two entries did not match."
+                pause_for_retry
+                continue
+            fi
+
+            if ! validate_master_password_strength "$MASTER_PASSWORD"; then
+                show_notice "Migration password was not accepted." "$LAST_STATUS"
+                pause_for_retry
+                continue
+            fi
+
+            prepare_runtime_vault
+            if head -n 1 "$LEGACY_PASSWORD_FILE" 2>/dev/null | grep -qx 'BASHPASS_V1'; then
+                awk -v header="$STORE_HEADER" 'NR == 1 { print header; next } { print }' \
+                    "$LEGACY_PASSWORD_FILE" > "$PASSWORD_FILE"
+            else
+                cp "$LEGACY_PASSWORD_FILE" "$PASSWORD_FILE"
+            fi
+            chmod 600 "$PASSWORD_FILE" 2>/dev/null
+            VAULT_UNLOCKED=1
+            if encrypt_file; then
+                wipe_file "$LEGACY_PASSWORD_FILE"
+                set_status "Legacy plaintext vault migrated and removed." "ok"
+                render_header
+                draw_panel_line "Legacy vault migration complete."
+                draw_panel_line "The encrypted vault is ready to use."
+                render_status_bar
+                pause_for_launch
+                return 0
+            fi
+
+            echo "Migration encryption failed."
+            exit 1
+        done
+    fi
+
+    setup_new_vault
+}
+
+save_record() {
     local service="$1"
     local username="$2"
     local password="$3"
-    validate_field "$service" "service"
-    validate_field "$username" "username"
-    validate_field "$password" "password"
+    local tmpfile
+
+    sanitize_field "$service" "service" || return 1
+    sanitize_field "$username" "username" || return 1
+    sanitize_field "$password" "password" || return 1
+
     ensure_password_file
-    echo "$service,$username,$password" >> "$PASSWORD_FILE"
-    echo "Saved for $service ($username)"
-    encrypt_file
-}
-
-view_passwords() {
-    echo ""
-    echo "Saved Passwords"
-    echo "--------------------------------------------------"
-    printf "%-20s %-20s %-30s\n" "SERVICE" "USERNAME" "PASSWORD"
-    echo "--------------------------------------------------"
-    if [[ -s "$PASSWORD_FILE" ]]; then
-        while IFS=',' read -r service username password; do
-            [[ "$service" == "$STORE_HEADER" ]] && continue
-            printf "%-20s %-20s %-30s\n" "$service" "$username" "$password"
-        done < "$PASSWORD_FILE"
-    else
-        echo "No saved passwords!"
-    fi
-}
-
-search_passwords() {
-    read -p "Enter service or username to search: " term
-    if [[ -z "$term" ]]; then
-        echo "Search term cannot be empty."
-        return
-    fi
-    local term_lc
-    term_lc=$(echo "$term" | tr '[:upper:]' '[:lower:]')
-    echo "--------------------------------------------------"
-    printf "%-20s %-20s %-30s\n" "SERVICE" "USERNAME" "PASSWORD"
-    echo "--------------------------------------------------"
-    awk -F',' -v term="$term_lc" -v header="$STORE_HEADER" '
+    tmpfile="$VAULT_TMPDIR/vault.write.tmp"
+    awk -F',' -v OFS=',' -v svc="$service" -v usr="$username" -v pass="$password" -v header="$STORE_HEADER" '
         BEGIN { found=0 }
-        {
-            if ($1 == header) next
-            line=tolower($0)
-            if (index(line, term)) {
-                printf "%-20s %-20s %-30s\n", $1, $2, $3
-                found=1
+        $1 == header { print; next }
+        ($1 == svc && $2 == usr) { print svc, usr, pass; found=1; next }
+        { print }
+        END {
+            if (!found) {
+                print svc, usr, pass
             }
         }
-        END { if (!found) print "No matches found." }
-    ' "$PASSWORD_FILE"
+    ' "$PASSWORD_FILE" > "$tmpfile"
+    chmod 600 "$tmpfile" 2>/dev/null
+    mv -f "$tmpfile" "$PASSWORD_FILE"
+    encrypt_file || return 1
+    set_status "Saved entry for $service ($username)." "ok"
+    return 0
 }
 
-list_services() {
-    echo "--------------------------------------------------"
-    echo "SERVICES"
-    echo "--------------------------------------------------"
-    awk -F',' -v header="$STORE_HEADER" '
-        $1 == header { next }
-        { services[$1]=1 }
-        END { for (s in services) print s }
-    ' "$PASSWORD_FILE" | sort
-}
+delete_record() {
+    local service="$1"
+    local username="$2"
+    local tmpfile matches
 
-upsert_password() {
-    read -p "Service Name: " service
-    read -p "Username/Email: " username
-    validate_field "$service" "service"
-    validate_field "$username" "username"
-    read -p "Password Length: " PASS_LENGTH
-    validate_number "$PASS_LENGTH"
-    local password
-    password=$(generate_password "$PASS_LENGTH")
-    echo "Generated Password: $password"
-    read -p "Save this password? (Y/N): " save
-    if [[ "$save" =~ ^[Yy]$ ]]; then
-        ensure_password_file
-        tmpfile=$(mktemp)
-        awk -F',' -v OFS=',' -v svc="$service" -v usr="$username" -v pass="$password" -v header="$STORE_HEADER" '
-            BEGIN { found=0 }
-            $1 == header { print; next }
-            ($1 == svc && $2 == usr) { print svc, usr, pass; found=1; next }
-            { print }
-            END {
-                if (!found) {
-                    print svc, usr, pass
-                }
-            }
-        ' "$PASSWORD_FILE" > "$tmpfile"
-        mv "$tmpfile" "$PASSWORD_FILE"
-        echo "Saved for $service ($username)"
-        encrypt_file
-    fi
-}
-
-delete_password() {
-    read -p "Service Name to delete: " service
-    read -p "Username/Email to delete: " username
-    validate_field "$service" "service"
-    validate_field "$username" "username"
-    local matches
     matches=$(awk -F',' -v svc="$service" -v usr="$username" -v header="$STORE_HEADER" '
         $1 == header { next }
         ($1 == svc && $2 == usr) { count++ }
         END { print count+0 }
     ' "$PASSWORD_FILE")
-    if [[ "$matches" -eq 0 ]]; then
-        echo "No matching entry found."
-        return
+
+    if (( matches == 0 )); then
+        set_status "No matching entry found." "warn"
+        return 1
     fi
-    read -p "Delete $matches matching entr$( [[ "$matches" -eq 1 ]] && echo "y" || echo "ies" )? (Y/N): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Delete canceled."
-        return
-    fi
-    tmpfile=$(mktemp)
+
+    tmpfile="$VAULT_TMPDIR/vault.delete.tmp"
     awk -F',' -v OFS=',' -v svc="$service" -v usr="$username" -v header="$STORE_HEADER" '
         $1 == header { print; next }
         !($1 == svc && $2 == usr) { print }
     ' "$PASSWORD_FILE" > "$tmpfile"
-    mv "$tmpfile" "$PASSWORD_FILE"
-    encrypt_file
-    echo "Deleted $matches matching entr$( [[ "$matches" -eq 1 ]] && echo "y" || echo "ies" )."
+    chmod 600 "$tmpfile" 2>/dev/null
+    mv -f "$tmpfile" "$PASSWORD_FILE"
+    encrypt_file || return 1
+    set_status "Deleted $matches matching entr$( (( matches == 1 )) && printf 'y' || printf 'ies' )." "ok"
+    return 0
 }
 
-copy_password() {
-    read -p "Service Name: " service
-    read -p "Username/Email: " username
-    validate_field "$service" "service"
-    validate_field "$username" "username"
-    local password
-    password=$(awk -F',' -v svc="$service" -v usr="$username" -v header="$STORE_HEADER" '
+entry_lines() {
+    awk -F',' -v header="$STORE_HEADER" '
         $1 == header { next }
-        ($1 == svc && $2 == usr) { print $3; exit }
-    ' "$PASSWORD_FILE")
-    if [[ -z "$password" ]]; then
-        echo "No matching entry found."
-        return
-    fi
-    if command -v pbcopy >/dev/null 2>&1; then
-        printf "%s" "$password" | pbcopy
-        echo "Password copied to clipboard (pbcopy)."
-        return
-    fi
-    if command -v xclip >/dev/null 2>&1; then
-        printf "%s" "$password" | xclip -selection clipboard
-        echo "Password copied to clipboard (xclip)."
-        return
-    fi
-    if command -v xsel >/dev/null 2>&1; then
-        printf "%s" "$password" | xsel --clipboard --input
-        echo "Password copied to clipboard (xsel)."
-        return
-    fi
-    echo "No clipboard tool found. Password: $password"
+        NF >= 3 { printf "%s\t%s\t%s\n", $1, $2, $3 }
+    ' "$PASSWORD_FILE"
 }
 
-save_custom_password() {
-    read -p "Service Name: " service
-    read -p "Username/Email: " username
-    read -p "Password: " password
-    save_password "$service" "$username" "$password"
-}
+select_entry() {
+    local title="$1"
+    local filter="${2:-}"
+    local -a raw_entries options
+    local filter_lc selection_index
+    local line service username password
 
-cleanup() {
-    encrypt_file
-    rm -f "$PASSWORD_FILE"
-    exit 0
-}
+    mapfile -t raw_entries < <(entry_lines)
+    if (( ${#raw_entries[@]} == 0 )); then
+        set_status "Vault is empty." "warn"
+        return 1
+    fi
 
-print_logo() {
-echo "
-▄▄▄▄·  ▄▄▄· .▄▄ ·  ▄ .▄ ▄▄▄· ▄▄▄· .▄▄ · .▄▄ · 
-▐█ ▀█▪▐█ ▀█ ▐█ ▀. ██▪▐█▐█ ▄█▐█ ▀█ ▐█ ▀. ▐█ ▀. 
-▐█▀▀█▄▄█▀▀█ ▄▀▀▀█▄██▀▀█ ██▀·▄█▀▀█ ▄▀▀▀█▄▄▀▀▀█▄
-██▄▪▐█▐█▪ ▐▌▐█▄▪▐███▌▐▀▐█▪·•▐█▪ ▐▌▐█▄▪▐█▐█▄▪▐█
-·▀▀▀▀  ▀  ▀  ▀▀▀▀ ▀▀▀ ·.▀    ▀  ▀  ▀▀▀▀  ▀▀▀▀ 
-"
-}
-
-# Draw a simple banner
-clear 
-setup_ui
-print_logo
-
-# Create data file if it doesn't exist
-if [[ ! -f "$ENCRYPTED_FILE" ]]; then
-    if [[ -f "$PASSWORD_FILE" ]] && [[ -s "$PASSWORD_FILE" ]]; then
-        echo "Found existing plaintext passwords!"
-        read -p "Enter a master password to encrypt existing data: " -s MASTER_PASSWORD
-        echo
-        encrypt_file
-        echo "Existing passwords have been encrypted."
-    else
-        echo "Welcome to BashPass! Let's set up your master password."
-        while true; do
-            read -p "Create a master password: " -s MASTER_PASSWORD
-            echo
-            read -p "Confirm master password: " -s MASTER_PASSWORD_CONFIRM
-            echo
-            if [[ "$MASTER_PASSWORD" == "$MASTER_PASSWORD_CONFIRM" ]]; then
-                echo "Master password set successfully!"
-                break
-            else
-                echo "Passwords don't match. Please try again."
+    if [[ -n "$filter" ]]; then
+        local -a filtered=()
+        filter_lc=$(printf "%s" "$filter" | tr '[:upper:]' '[:lower:]')
+        for line in "${raw_entries[@]}"; do
+            if [[ "$(printf "%s" "$line" | tr '[:upper:]' '[:lower:]')" == *"$filter_lc"* ]]; then
+                filtered+=("$line")
             fi
         done
-        echo "$STORE_HEADER" > "$PASSWORD_FILE"
-        encrypt_file
-        rm -f "$PASSWORD_FILE"
-        echo "Your password vault is now encrypted!"
+        raw_entries=("${filtered[@]}")
     fi
-else
-    echo "Encrypted password store detected!"
-fi
+
+    if (( ${#raw_entries[@]} == 0 )); then
+        set_status "No entries matched the current query." "warn"
+        return 1
+    fi
+
+    for line in "${raw_entries[@]}"; do
+        IFS=$'\t' read -r service username password <<<"$line"
+        options+=("$service :: $username")
+    done
+
+    if ! selection_index=$(menu_select "$title" 0 "${options[@]}"); then
+        set_status "Selection canceled." "info"
+        return 1
+    fi
+
+    printf "%s" "${raw_entries[$selection_index]}"
+}
+
+copy_to_clipboard() {
+    local value="$1"
+    local copied_with=""
+
+    if command -v pbcopy >/dev/null 2>&1; then
+        printf "%s" "$value" | pbcopy
+        (
+            sleep "$CLIPBOARD_TIMEOUT"
+            pbcopy < /dev/null
+        ) >/dev/null 2>&1 &
+        copied_with="pbcopy"
+    elif command -v xclip >/dev/null 2>&1; then
+        printf "%s" "$value" | xclip -selection clipboard
+        (
+            sleep "$CLIPBOARD_TIMEOUT"
+            printf "" | xclip -selection clipboard
+        ) >/dev/null 2>&1 &
+        copied_with="xclip"
+    elif command -v xsel >/dev/null 2>&1; then
+        printf "%s" "$value" | xsel --clipboard --input
+        (
+            sleep "$CLIPBOARD_TIMEOUT"
+            printf "" | xsel --clipboard --input
+        ) >/dev/null 2>&1 &
+        copied_with="xsel"
+    fi
+
+    if [[ -n "$copied_with" ]]; then
+        set_status "Password copied with $copied_with; clipboard will clear in ${CLIPBOARD_TIMEOUT}s." "ok"
+        return 0
+    fi
+
+    set_status "No clipboard utility found; password not copied." "warn"
+    return 1
+}
+
+prompt_line() {
+    local prompt="$1"
+    local default="${2:-}"
+    local value
+
+    if [[ -n "$default" ]]; then
+        printf "%b%s [%s]:%b " "$C_PROMPT" "$prompt" "$default" "$C_RESET"
+    else
+        printf "%b%s:%b " "$C_PROMPT" "$prompt" "$C_RESET"
+    fi
+    read -r value
+    if [[ -z "$value" && -n "$default" ]]; then
+        value="$default"
+    fi
+    PROMPT_VALUE="$value"
+}
+
+upsert_password_flow() {
+    local service username length password
+
+    render_header
+    draw_panel_line "Generate and save a high-entropy password"
+    draw_panel_line "Generator uses /dev/urandom-backed selection, not Bash RANDOM."
+    draw_rule
+
+    prompt_line "Service Name" || return
+    service="$PROMPT_VALUE"
+    prompt_line "Username / Email" || return
+    username="$PROMPT_VALUE"
+    prompt_line "Password Length" "24" || return
+    length="$PROMPT_VALUE"
+
+    sanitize_field "$service" "service" || return
+    sanitize_field "$username" "username" || return
+    validate_number "$length" || return
+
+    password=$(generate_password "$length")
+    printf "\n%bGenerated Password%b\n%s\n\n" "$C_TITLE" "$C_RESET" "$password"
+    printf "%bSave this password? [y/N]:%b " "$C_PROMPT" "$C_RESET"
+    read -r confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        save_record "$service" "$username" "$password"
+    else
+        set_status "Generated password discarded." "info"
+    fi
+}
+
+save_custom_password_flow() {
+    local service username password strength confirm
+
+    render_header
+    draw_panel_line "Add a custom password"
+    draw_panel_line "Input stays hidden; weak secrets require explicit confirmation."
+    draw_rule
+
+    prompt_line "Service Name" || return
+    service="$PROMPT_VALUE"
+    prompt_line "Username / Email" || return
+    username="$PROMPT_VALUE"
+    sanitize_field "$service" "service" || return
+    sanitize_field "$username" "username" || return
+
+    printf "%bPassword:%b " "$C_PROMPT" "$C_RESET"
+    read -rsp "" password
+    printf "\n"
+    sanitize_field "$password" "password" || return
+    strength=$(password_strength_label "$password")
+
+    if [[ "$strength" == "weak" ]]; then
+        printf "%bPassword quality is weak. Save anyway? [y/N]:%b " "$C_WARN" "$C_RESET"
+        read -r confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            set_status "Weak password was not saved." "info"
+            return
+        fi
+    fi
+
+    save_record "$service" "$username" "$password"
+}
+
+mask_password() {
+    local password="$1"
+    local len=${#password}
+    if (( len <= 4 )); then
+        repeat_char "$len" "*"
+        return
+    fi
+    printf "%s%s" "${password:0:2}" "$(repeat_char $((len - 2)) "*")"
+}
+
+show_entries_table() {
+    local title="$1"
+    local filter="${2:-}"
+    local reveal="${3:-0}"
+    local line service username password shown
+
+    render_header
+    draw_panel_line "$title"
+    if [[ -n "$filter" ]]; then
+        draw_panel_line "Query: $filter"
+    fi
+    draw_rule
+    printf "%-24s %-28s %-24s\n" "SERVICE" "USERNAME" "PASSWORD"
+    printf "%s\n" "$(repeat_char "$(term_width)" "-")"
+
+    while IFS=$'\t' read -r service username password; do
+        if [[ -n "$filter" ]]; then
+            local row_lc
+            row_lc=$(printf "%s\t%s\t%s" "$service" "$username" "$password" | tr '[:upper:]' '[:lower:]')
+            if [[ "$row_lc" != *"$(printf "%s" "$filter" | tr '[:upper:]' '[:lower:]')"* ]]; then
+                continue
+            fi
+        fi
+        if (( reveal == 1 )); then
+            shown="$password"
+        else
+            shown=$(mask_password "$password")
+        fi
+        printf "%-24.24s %-28.28s %-24.24s\n" "$service" "$username" "$shown"
+    done < <(entry_lines)
+}
+
+browse_vault_flow() {
+    local reveal_choice
+    show_entries_table "Vault Browser" "" 0
+    printf "\n%bReveal passwords in this view? [y/N]:%b " "$C_PROMPT" "$C_RESET"
+    read -r reveal_choice
+    if [[ "$reveal_choice" =~ ^[Yy]$ ]]; then
+        show_entries_table "Vault Browser" "" 1
+    fi
+    set_status "Vault browser closed." "info"
+}
+
+search_vault_flow() {
+    local term reveal_choice
+    render_header
+    draw_panel_line "Search vault"
+    draw_rule
+    prompt_line "Search term"
+    term="$PROMPT_VALUE"
+    if [[ -z "$term" ]]; then
+        set_status "Search term cannot be empty." "warn"
+        return
+    fi
+    show_entries_table "Search Results" "$term" 0
+    printf "\n%bReveal matching passwords? [y/N]:%b " "$C_PROMPT" "$C_RESET"
+    read -r reveal_choice
+    if [[ "$reveal_choice" =~ ^[Yy]$ ]]; then
+        show_entries_table "Search Results" "$term" 1
+    fi
+    set_status "Search complete." "ok"
+}
+
+list_services_flow() {
+    render_header
+    draw_panel_line "Services"
+    draw_rule
+    awk -F',' -v header="$STORE_HEADER" '
+        $1 == header { next }
+        NF >= 2 { services[$1]=1 }
+        END { for (s in services) print s }
+    ' "$PASSWORD_FILE" | sort
+    set_status "Service list rendered." "ok"
+}
+
+delete_password_flow() {
+    local selection service username password confirm
+    if ! selection=$(select_entry "Select entry to delete"); then
+        return
+    fi
+    IFS=$'\t' read -r service username password <<<"$selection"
+
+    render_header
+    draw_panel_line "Delete entry"
+    draw_panel_line "Service : $service"
+    draw_panel_line "Username: $username"
+    draw_rule
+    printf "%bDelete this entry? [y/N]:%b " "$C_WARN" "$C_RESET"
+    read -r confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        delete_record "$service" "$username"
+    else
+        set_status "Delete canceled." "info"
+    fi
+}
+
+copy_password_flow() {
+    local selection service username password reveal_choice
+    if ! selection=$(select_entry "Select entry to copy"); then
+        return
+    fi
+    IFS=$'\t' read -r service username password <<<"$selection"
+
+    render_header
+    draw_panel_line "Copy password"
+    draw_panel_line "Service : $service"
+    draw_panel_line "Username: $username"
+    draw_rule
+    printf "%bCopy password to clipboard? [y/N]:%b " "$C_PROMPT" "$C_RESET"
+    read -r reveal_choice
+    if [[ "$reveal_choice" =~ ^[Yy]$ ]]; then
+        if ! copy_to_clipboard "$password"; then
+            printf "%bClipboard unavailable. Reveal password here? [y/N]:%b " "$C_WARN" "$C_RESET"
+            read -r reveal_choice
+            if [[ "$reveal_choice" =~ ^[Yy]$ ]]; then
+                printf "\n%bPassword:%b %s\n" "$C_TITLE" "$C_RESET" "$password"
+                set_status "Password revealed in terminal because clipboard was unavailable." "warn"
+            fi
+        fi
+    else
+        set_status "Copy canceled." "info"
+    fi
+}
+
+bootstrap_vault() {
+    setup_ui
+    prepare_runtime_vault
+
+    if [[ -f "$ENCRYPTED_FILE" ]]; then
+        set_status "Encrypted vault detected." "info"
+    else
+        maybe_migrate_plaintext_store
+    fi
+}
 
 main_menu() {
-    prompt_master_password
-    trap cleanup EXIT
+    local selection=0
+    if [[ $VAULT_UNLOCKED -ne 1 ]]; then
+        prompt_master_password
+    fi
     while true; do
-        clear
-        print_logo
-        render_hacker_dashboard
-        echo
-        printf "%broot@bashpass%b:%b~/vault%b$ " "$C_PROMPT" "$C_RESET" "$C_DIM" "$C_RESET"
-        read -r choice
-        case "$choice" in
-            1)
-                ui_section "Generate or Update"
-                upsert_password
-                pause_for_user
-                ;;
-            2)
-                ui_section "Add Custom Password"
-                save_custom_password
-                pause_for_user
-                ;;
-            3)
-                ui_section "Saved Passwords"
-                view_passwords
-                pause_for_user
-                ;;
-            4)
-                ui_section "Search Vault"
-                search_passwords
-                pause_for_user
-                ;;
-            5)
-                ui_section "Delete Password"
-                delete_password
-                pause_for_user
-                ;;
-            6)
-                ui_section "Service List"
-                list_services
-                pause_for_user
-                ;;
-            7)
-                ui_section "Copy Password"
-                copy_password
-                pause_for_user
-                ;;
-            8)
-                printf "%bBye!%b\n" "$C_OK" "$C_RESET"
-                break
-                ;;
-            *)
-                printf "%bInvalid command. Use 1-8.%b\n" "$C_WARN" "$C_RESET"
-                pause_for_user
-                ;;
+        if menu_select "Choose an action" "$selection" "${MENU_ITEMS[@]}"; then
+            selection="$MENU_SELECTION"
+        else
+            selection=7
+        fi
+
+        case "$selection" in
+            0) upsert_password_flow ;;
+            1) save_custom_password_flow ;;
+            2) browse_vault_flow ;;
+            3) search_vault_flow ;;
+            4) delete_password_flow ;;
+            5) list_services_flow ;;
+            6) copy_password_flow ;;
+            7) break ;;
         esac
+
+        if (( selection != 7 )); then
+            pause_for_user
+        fi
     done
 }
 
+trap cleanup EXIT INT TERM HUP
+
+bootstrap_vault
 main_menu
